@@ -1,0 +1,1721 @@
+# -*- coding: utf-8 -*-
+
+
+from pathlib import Path
+import warnings
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import pm4py
+
+from pm4py.algo.evaluation.generalization import algorithm as generalization_evaluator
+from pm4py.algo.evaluation.precision import algorithm as precision_evaluator
+from pm4py.algo.evaluation.replay_fitness import algorithm as fitness_evaluator
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ============================================================
+# ANALYSIS CONFIGURATION
+# ============================================================
+
+CASE = "case:concept:name"
+ACTIVITY = "concept:name"
+TIME = "time:timestamp"
+LIFECYCLE = "lifecycle:transition"
+RESOURCE = "org:resource"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 1400)
+pd.set_option("display.max_colwidth", 250)
+
+SHOW_VISUALS = False
+
+OUTPUT_DIR = Path.cwd() / "bpi2017_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# SUPPORTING FUNCTIONS
+# ============================================================
+
+def section(title, width=100):
+    """Print a consistent section header."""
+    print("\n" + "=" * width)
+    print(title)
+    print("=" * width)
+
+
+def locate_event_log():
+    """Find the BPI Challenge 2017 XES file in common local/Colab locations."""
+    candidates = []
+
+    if "__file__" in globals():
+        script_dir = Path(__file__).resolve().parent
+        candidates.extend([
+            script_dir / "BPI Challenge 2017.xes",
+            script_dir / "BPI Challenge 2017.xes.gz",
+        ])
+
+    # Remove duplicates while preserving order.
+    unique_candidates = []
+    seen = set()
+    for path in candidates:
+        path_str = str(path)
+        if path_str not in seen:
+            unique_candidates.append(path)
+            seen.add(path_str)
+
+    for path in unique_candidates:
+        if path.exists():
+            return path
+
+    searched = "\n".join(f"  - {p}" for p in unique_candidates)
+    raise FileNotFoundError(
+        "BPI Challenge 2017 event log was not found.\n"
+        "Searched these locations:\n"
+        f"{searched}"
+    )
+
+
+def rule_summary(rule_name, result_df, applicable_col="Applicable", compliant_col="Compliant"):
+    """Create one standardized summary row for a case/offer-level compliance rule."""
+    applicable_df = result_df[result_df[applicable_col].eq(True)].copy()
+    applicable = len(applicable_df)
+    compliant = applicable_df[compliant_col].eq(True).sum()
+    deviations = applicable_df[compliant_col].eq(False).sum()
+    rate = deviations / applicable * 100 if applicable else 0.0
+
+    print(f"\n{rule_name}")
+    print("-" * len(rule_name))
+    print(f"Applicable units : {applicable:,}")
+    print(f"Compliant units  : {compliant:,}")
+    print(f"Deviations       : {deviations:,}")
+    print(f"Deviation rate   : {rate:.2f}%")
+
+    return {
+        "Rule": rule_name,
+        "Applicable": int(applicable),
+        "Compliant": int(compliant),
+        "Deviations": int(deviations),
+        "Deviation_Rate_%": round(float(rate), 2),
+    }
+
+
+def safe_mean(series):
+    """Return a float mean without failing on an empty Series."""
+    return float(series.mean()) if len(series) else float("nan")
+
+
+# ============================================================
+# TASK 1 - DATASET UNDERSTANDING
+# ============================================================
+
+section("TASK 1 - DATASET UNDERSTANDING")
+
+FILE_PATH = locate_event_log()
+print("Loading event log...")
+print("File:", FILE_PATH)
+
+df_discovery = pm4py.read_xes(str(FILE_PATH))
+
+# Keep only rows that contain the three mandatory event-log attributes.
+df_discovery = df_discovery.dropna(
+    subset=[CASE, ACTIVITY, TIME]
+).copy()
+
+# Remove duplicate event rows.
+df_discovery = df_discovery.drop_duplicates().copy()
+
+# Standardize timestamps.
+df_discovery[TIME] = pd.to_datetime(
+    df_discovery[TIME],
+    utc=True,
+)
+
+# Preserve the original row order so that equal timestamps remain stable.
+df_discovery["_event_order"] = range(len(df_discovery))
+
+df_discovery = df_discovery.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable",
+).copy()
+
+raw_event_count = len(df_discovery)
+raw_case_count = df_discovery[CASE].nunique()
+raw_activity_count = df_discovery[ACTIVITY].nunique()
+raw_resource_count = (
+    df_discovery[RESOURCE].nunique()
+    if RESOURCE in df_discovery.columns
+    else 0
+)
+
+print(f"Total Number of Events : {raw_event_count:,}")
+print(f"Number of Cases        : {raw_case_count:,}")
+print(f"Unique Activities      : {raw_activity_count:,}")
+print(f"Unique Resources       : {raw_resource_count:,}")
+
+print("\nEvent-log excerpt:")
+print(
+    df_discovery[[CASE, ACTIVITY, TIME]]
+    .head()
+    .to_string(index=False)
+)
+
+
+# ============================================================
+# TASK 2 - EVENT LOG PREPARATION
+# ============================================================
+
+
+
+# ------------------------------------------------------------
+# 2.3 / 2.4 Business-Level Event Log
+# ------------------------------------------------------------
+
+if LIFECYCLE not in df_discovery.columns:
+    raise KeyError(
+        f"The required lifecycle column '{LIFECYCLE}' is not present."
+    )
+
+business_df = df_discovery[
+    (
+        df_discovery[ACTIVITY].str.startswith(("A_", "O_"), na=False)
+        & df_discovery[LIFECYCLE].eq("complete")
+    )
+    |
+    (
+        df_discovery[ACTIVITY].str.startswith("W_", na=False)
+        & df_discovery[LIFECYCLE].eq("schedule")
+    )
+].copy()
+
+business_df = business_df.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable",
+).copy()
+
+print("\nBusiness-level log created.")
+print(f"Raw events            : {len(df_discovery):,}")
+print(f"Business-level events : {len(business_df):,}")
+print(f"Business-level cases  : {business_df[CASE].nunique():,}")
+
+
+# ============================================================
+# TASK 3 - PROCESS DISCOVERY
+# ============================================================
+
+section("TASK 3 - PROCESS DISCOVERY")
+
+
+# ------------------------------------------------------------
+# 3.1 Directly-Follows Graph (DFG) Overview
+# ------------------------------------------------------------
+
+print("\n3.1 Directly-Follows Graph (DFG)")
+
+dfg, start_activities, end_activities = pm4py.discover_dfg(business_df)
+
+pm4py.save_vis_dfg(
+    dfg,
+    start_activities,
+    end_activities,
+    file_path=str(OUTPUT_DIR / "spaghetti_model.png"),
+)
+
+if SHOW_VISUALS:
+    pm4py.view_dfg(dfg, start_activities, end_activities)
+
+print("Saved:", OUTPUT_DIR / "spaghetti_model.png")
+
+
+# ------------------------------------------------------------
+# 3.2 Algorithmic Comparison
+#     - Inductive Miner
+#     - Heuristic Miner
+# ------------------------------------------------------------
+
+print("\n3.2 Algorithmic Comparison")
+
+filtered_df = pm4py.filter_variants_top_k(business_df, 10)
+
+# Inductive Miner
+net, im, fm = pm4py.discover_petri_net_inductive(filtered_df)
+
+pm4py.save_vis_petri_net(
+    net,
+    im,
+    fm,
+    file_path=str(OUTPUT_DIR / "inductive_model_top10.png"),
+)
+
+if SHOW_VISUALS:
+    pm4py.view_petri_net(net, im, fm)
+
+# Heuristic Miner
+net_h, im_h, fm_h = pm4py.discover_petri_net_heuristics(filtered_df)
+
+pm4py.save_vis_petri_net(
+    net_h,
+    im_h,
+    fm_h,
+    file_path=str(OUTPUT_DIR / "heuristic_model_top10.png"),
+)
+
+if SHOW_VISUALS:
+    pm4py.view_petri_net(net_h, im_h, fm_h)
+
+
+# ------------------------------------------------------------
+# 3.3 Evaluate Model Quality
+# ------------------------------------------------------------
+
+print("\n3.3 Model Quality Evaluation")
+
+fitness_results = fitness_evaluator.apply(filtered_df, net, im, fm)
+precision_result = precision_evaluator.apply(filtered_df, net, im, fm)
+generalization_result = generalization_evaluator.apply(filtered_df, net, im, fm)
+
+fitness_results_h = fitness_evaluator.apply(filtered_df, net_h, im_h, fm_h)
+precision_result_h = precision_evaluator.apply(filtered_df, net_h, im_h, fm_h)
+generalization_result_h = generalization_evaluator.apply(
+    filtered_df, net_h, im_h, fm_h
+)
+
+model_quality = pd.DataFrame([
+    {
+        "Model": "Inductive Miner",
+        "Fitness": fitness_results["average_trace_fitness"],
+        "Precision": precision_result,
+        "Generalization": generalization_result,
+        "Places": len(net.places),
+        "Transitions": len(net.transitions),
+    },
+    {
+        "Model": "Heuristic Miner",
+        "Fitness": fitness_results_h["average_trace_fitness"],
+        "Precision": precision_result_h,
+        "Generalization": generalization_result_h,
+        "Places": len(net_h.places),
+        "Transitions": len(net_h.transitions),
+    },
+])
+
+for col in ["Fitness", "Precision", "Generalization"]:
+    model_quality[col] = model_quality[col].astype(float).round(3)
+
+print(model_quality.to_string(index=False))
+model_quality.to_csv(OUTPUT_DIR / "model_quality_comparison.csv", index=False)
+
+
+# ------------------------------------------------------------
+# 3.4 AS-IS Process Model (BPMN)
+# ------------------------------------------------------------
+
+print("\n3.4 AS-IS Process Model")
+
+bpmn_model = pm4py.discover_bpmn_inductive(filtered_df)
+
+pm4py.write_bpmn(
+    bpmn_model,
+    str(OUTPUT_DIR / "Reference_Model_BPMN_Top10.bpmn"),
+)
+
+pm4py.save_vis_bpmn(
+    bpmn_model,
+    str(OUTPUT_DIR / "Reference_Model_BPMN_Top10.png"),
+)
+
+if SHOW_VISUALS:
+    pm4py.view_bpmn(bpmn_model)
+
+print("Saved:", OUTPUT_DIR / "Reference_Model_BPMN_Top10.png")
+
+
+# ------------------------------------------------------------
+# 3.5 Variant Analysis
+# ------------------------------------------------------------
+
+print("\n3.5 Variant Analysis")
+
+total_cases = business_df[CASE].nunique()
+
+case_variants = (
+    business_df
+    .groupby(CASE, sort=False)
+    .agg(
+        Variant=(ACTIVITY, lambda x: tuple(x)),
+        Start_Time=(TIME, "min"),
+        End_Time=(TIME, "max"),
+    )
+    .reset_index()
+)
+
+case_variants["Duration_Days"] = (
+    case_variants["End_Time"]
+    - case_variants["Start_Time"]
+).dt.total_seconds() / 86400
+
+variant_stats = (
+    case_variants
+    .groupby("Variant")
+    .agg(
+        Frequency=(CASE, "count"),
+        Average_Duration_Days=("Duration_Days", "mean"),
+        Median_Duration_Days=("Duration_Days", "median"),
+    )
+    .reset_index()
+    .sort_values("Frequency", ascending=False)
+    .reset_index(drop=True)
+)
+
+variant_stats["Percentage"] = (
+    variant_stats["Frequency"] / total_cases * 100
+)
+variant_stats["Variant_ID"] = range(1, len(variant_stats) + 1)
+variant_stats["Label"] = "V" + variant_stats["Variant_ID"].astype(str)
+variant_stats["Path"] = variant_stats["Variant"].apply(
+    lambda x: " -> ".join(x)
+)
+
+top10_variants = variant_stats.head(10)[
+    [
+        "Label",
+        "Frequency",
+        "Percentage",
+        "Average_Duration_Days",
+        "Median_Duration_Days",
+        "Path",
+    ]
+].copy()
+
+for col in ["Percentage", "Average_Duration_Days", "Median_Duration_Days"]:
+    top10_variants[col] = top10_variants[col].round(2)
+
+top10_cases = top10_variants["Frequency"].sum()
+top10_coverage = top10_cases / total_cases * 100
+
+print(f"Number of unique variants : {len(variant_stats):,}")
+print(f"Top 10 variant coverage   : {top10_coverage:.2f}%")
+print("\nTop 10 variants:")
+print(top10_variants.to_string(index=False))
+
+top10_variants.to_csv(
+    OUTPUT_DIR / "top_10_variants.csv",
+    index=False,
+)
+
+
+# ============================================================
+# TASK 4 - PERFORMANCE ANALYSIS
+# ============================================================
+
+section("TASK 4 - PERFORMANCE ANALYSIS")
+
+
+# ------------------------------------------------------------
+# 4.1 Throughput Time
+# ------------------------------------------------------------
+
+print("\n4.1 Throughput Time")
+
+case_duration = (
+    df_discovery
+    .groupby(CASE)[TIME]
+    .agg(["min", "max"])
+)
+
+case_duration["Duration_Days"] = (
+    case_duration["max"]
+    - case_duration["min"]
+).dt.total_seconds() / 86400
+
+average_duration = case_duration["Duration_Days"].mean()
+median_duration = case_duration["Duration_Days"].median()
+p90_duration = case_duration["Duration_Days"].quantile(0.90)
+
+throughput_summary = pd.DataFrame({
+    "Metric": [
+        "Average Case Duration (Days)",
+        "Median Case Duration (Days)",
+        "P90 Case Duration (Days)",
+    ],
+    "Value": [
+        round(average_duration, 2),
+        round(median_duration, 2),
+        round(p90_duration, 2),
+    ],
+})
+
+print(throughput_summary.to_string(index=False))
+
+
+# ------------------------------------------------------------
+# 4.2 Activity Frequency
+# ------------------------------------------------------------
+
+print("\n4.2 Activity Frequency")
+
+activity_frequency = business_df[ACTIVITY].value_counts()
+top10_activities = activity_frequency.head(10)
+
+print(top10_activities.to_string())
+
+
+# ------------------------------------------------------------
+# 4.3 Resource Workload
+# ------------------------------------------------------------
+
+print("\n4.3 Resource Workload")
+
+if RESOURCE in business_df.columns:
+    business_resource_df = business_df[
+        business_df[RESOURCE].notna()
+    ].copy()
+
+    resource_workload = (
+        business_resource_df
+        .groupby(RESOURCE)
+        .agg(
+            Events=(ACTIVITY, "size"),
+            Cases=(CASE, "nunique"),
+        )
+        .reset_index()
+    )
+
+    resource_workload["Events_per_Case"] = (
+        resource_workload["Events"]
+        / resource_workload["Cases"]
+    )
+
+    resource_workload = resource_workload.sort_values(
+        "Events",
+        ascending=False,
+    )
+
+    top10_resources = resource_workload.head(10).copy()
+    top10_resources["Events_per_Case"] = (
+        top10_resources["Events_per_Case"].round(2)
+    )
+
+    print(f"Resources observed: {resource_workload[RESOURCE].nunique():,}")
+    print(top10_resources.to_string(index=False))
+else:
+    resource_workload = pd.DataFrame()
+    top10_resources = pd.DataFrame()
+    print("org:resource is not available.")
+
+
+# ------------------------------------------------------------
+# 4.4 Rework Analysis
+# ------------------------------------------------------------
+
+print("\n4.4 Rework Analysis")
+
+case_activity_counts = (
+    business_df
+    .groupby([CASE, ACTIVITY])
+    .size()
+    .reset_index(name="Executions")
+)
+
+rework_occurrences = case_activity_counts[
+    case_activity_counts["Executions"] > 1
+].copy()
+
+rework_occurrences["Extra_Executions"] = (
+    rework_occurrences["Executions"] - 1
+)
+
+cases_with_rework = rework_occurrences[CASE].nunique()
+rework_case_percentage = cases_with_rework / total_cases * 100
+
+rework_by_activity = (
+    rework_occurrences
+    .groupby(ACTIVITY)
+    .agg(
+        Cases_with_Rework=(CASE, "nunique"),
+        Total_Executions=("Executions", "sum"),
+        Extra_Executions=("Extra_Executions", "sum"),
+        Average_Executions_in_Reworked_Cases=("Executions", "mean"),
+    )
+    .reset_index()
+    .sort_values(
+        ["Cases_with_Rework", "Extra_Executions"],
+        ascending=False,
+    )
+)
+
+rework_by_activity["Average_Executions_in_Reworked_Cases"] = (
+    rework_by_activity["Average_Executions_in_Reworked_Cases"].round(2)
+)
+
+print(f"Cases with at least one repeated activity: {cases_with_rework:,}")
+print(f"Percentage of cases with rework candidates: {rework_case_percentage:.2f}%")
+print(rework_by_activity.head(10).to_string(index=False))
+
+
+# ------------------------------------------------------------
+# 4.5 Process Complexity
+# ------------------------------------------------------------
+
+print("\n4.5 Process Complexity")
+
+distinct_activities = business_df[ACTIVITY].nunique()
+unique_variants = len(variant_stats)
+dfg_edges = len(dfg)
+
+complexity_summary = pd.DataFrame({
+    "Metric": [
+        "Distinct Business Activities",
+        "Unique Process Variants",
+        "Unique DFG Edges",
+        "Top 10 Variant Coverage (%)",
+    ],
+    "Value": [
+        distinct_activities,
+        unique_variants,
+        dfg_edges,
+        round(top10_coverage, 2),
+    ],
+})
+
+print(complexity_summary.to_string(index=False))
+
+
+
+
+
+# ------------------------------------------------------------
+# 4.7 Bottleneck Analysis
+# ------------------------------------------------------------
+
+print("\n4.7 Bottleneck Analysis")
+
+
+# ------------------------------------------------------------
+# 4.7.1 High-Level Bottlenecks
+# Measures elapsed time between consecutive business-level events.
+# ------------------------------------------------------------
+
+print("\n4.7.1 High-Level Bottlenecks")
+
+bottleneck_df = business_df[
+    [CASE, ACTIVITY, TIME, "_event_order"]
+].copy()
+
+bottleneck_df = bottleneck_df.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable",
+)
+
+case_group = bottleneck_df.groupby(CASE, sort=False)
+
+bottleneck_df["Next_Activity"] = case_group[ACTIVITY].shift(-1)
+bottleneck_df["Next_Timestamp"] = case_group[TIME].shift(-1)
+
+bottleneck_df["Elapsed_Days"] = (
+    bottleneck_df["Next_Timestamp"]
+    - bottleneck_df[TIME]
+).dt.total_seconds() / 86400
+
+bottleneck_valid = bottleneck_df.dropna(
+    subset=["Next_Activity", "Elapsed_Days"]
+).copy()
+
+transition_performance = (
+    bottleneck_valid
+    .groupby([ACTIVITY, "Next_Activity"])
+    .agg(
+        Frequency=("Elapsed_Days", "size"),
+        Average_Elapsed_Days=("Elapsed_Days", "mean"),
+        Median_Elapsed_Days=("Elapsed_Days", "median"),
+        P90_Elapsed_Days=("Elapsed_Days", lambda x: x.quantile(0.90)),
+    )
+    .reset_index()
+    .rename(columns={ACTIVITY: "From_Activity"})
+)
+
+MIN_FREQUENCY = 500
+terminal_states = ["A_Cancelled", "A_Denied", "A_Pending"]
+
+top_bottlenecks = (
+    transition_performance[
+        transition_performance["Frequency"] >= MIN_FREQUENCY
+    ]
+    .loc[lambda x: ~x["Next_Activity"].isin(terminal_states)]
+    .sort_values("Average_Elapsed_Days", ascending=False)
+    .head(10)
+    .copy()
+)
+
+for col in [
+    "Average_Elapsed_Days",
+    "Median_Elapsed_Days",
+    "P90_Elapsed_Days",
+]:
+    top_bottlenecks[col] = top_bottlenecks[col].round(2)
+
+top_bottlenecks["Transition"] = (
+    top_bottlenecks["From_Activity"]
+    + " -> "
+    + top_bottlenecks["Next_Activity"]
+)
+
+print(
+    top_bottlenecks[
+        [
+            "Transition",
+            "Frequency",
+            "Average_Elapsed_Days",
+            "Median_Elapsed_Days",
+            "P90_Elapsed_Days",
+        ]
+    ].to_string(index=False)
+)
+
+
+# ------------------------------------------------------------
+# 4.7.2 Lifecycle Reconstruction
+# Queue Time      = schedule -> start
+# Active Time     = start/resume -> suspend/complete/abort/withdraw
+# Suspension Time = suspend -> resume/complete/abort/withdraw
+# Total Cycle     = schedule -> first end event
+# ------------------------------------------------------------
+
+print("\n4.7.2 Lifecycle Reconstruction")
+
+workflow_df = df_discovery[
+    df_discovery[ACTIVITY].str.startswith("W_", na=False)
+].copy()
+
+workflow_df = workflow_df.sort_values(
+    [CASE, ACTIVITY, TIME, "_event_order"],
+    kind="stable",
+)
+
+workflow_df["Occurrence_ID"] = (
+    workflow_df
+    .groupby([CASE, ACTIVITY], sort=False)[LIFECYCLE]
+    .transform(lambda x: x.eq("schedule").cumsum())
+)
+
+workflow_df = workflow_df[
+    workflow_df["Occurrence_ID"] > 0
+].copy()
+
+occurrence_cols = [CASE, ACTIVITY, "Occurrence_ID"]
+occ_group = workflow_df.groupby(occurrence_cols, sort=False)
+
+workflow_df["Next_Lifecycle"] = occ_group[LIFECYCLE].shift(-1)
+workflow_df["Next_Timestamp"] = occ_group[TIME].shift(-1)
+workflow_df["Segment_Hours"] = (
+    workflow_df["Next_Timestamp"]
+    - workflow_df[TIME]
+).dt.total_seconds() / 3600
+
+active_mask = (
+    workflow_df[LIFECYCLE].isin(["start", "resume"])
+    & workflow_df["Next_Lifecycle"].isin(
+        ["suspend", "complete", "ate_abort", "withdraw"]
+    )
+)
+
+workflow_df["Active_Segment_Hours"] = (
+    workflow_df["Segment_Hours"].where(active_mask, 0.0)
+)
+
+suspension_mask = (
+    workflow_df[LIFECYCLE].eq("suspend")
+    & workflow_df["Next_Lifecycle"].isin(
+        ["resume", "complete", "ate_abort", "withdraw"]
+    )
+)
+
+workflow_df["Suspension_Segment_Hours"] = (
+    workflow_df["Segment_Hours"].where(suspension_mask, 0.0)
+)
+
+occurrences = (
+    workflow_df[workflow_df[LIFECYCLE].eq("schedule")]
+    .groupby(occurrence_cols, as_index=False)[TIME]
+    .min()
+    .rename(columns={TIME: "Schedule_Time"})
+)
+
+start_times = (
+    workflow_df[workflow_df[LIFECYCLE].eq("start")]
+    .groupby(occurrence_cols, as_index=False)[TIME]
+    .min()
+    .rename(columns={TIME: "Start_Time"})
+)
+
+end_events = (
+    workflow_df[
+        workflow_df[LIFECYCLE].isin(
+            ["complete", "ate_abort", "withdraw"]
+        )
+    ]
+    .sort_values(
+        occurrence_cols + [TIME, "_event_order"],
+        kind="stable",
+    )
+)
+
+first_end = (
+    end_events
+    .groupby(occurrence_cols, sort=False)
+    .head(1)[occurrence_cols + [TIME, LIFECYCLE]]
+    .rename(
+        columns={
+            TIME: "End_Time",
+            LIFECYCLE: "End_Status",
+        }
+    )
+)
+
+active_totals = (
+    workflow_df
+    .groupby(occurrence_cols, as_index=False)["Active_Segment_Hours"]
+    .sum()
+    .rename(
+        columns={
+            "Active_Segment_Hours": "Active_Processing_Hours"
+        }
+    )
+)
+
+suspension_totals = (
+    workflow_df
+    .groupby(occurrence_cols, as_index=False)["Suspension_Segment_Hours"]
+    .sum()
+    .rename(
+        columns={
+            "Suspension_Segment_Hours": "Suspension_Time_Hours"
+        }
+    )
+)
+
+occurrences = (
+    occurrences
+    .merge(start_times, on=occurrence_cols, how="left")
+    .merge(first_end, on=occurrence_cols, how="left")
+    .merge(active_totals, on=occurrence_cols, how="left")
+    .merge(suspension_totals, on=occurrence_cols, how="left")
+)
+
+occurrences["Queue_Time_Hours"] = (
+    occurrences["Start_Time"]
+    - occurrences["Schedule_Time"]
+).dt.total_seconds() / 3600
+
+occurrences["Total_Cycle_Hours"] = (
+    occurrences["End_Time"]
+    - occurrences["Schedule_Time"]
+).dt.total_seconds() / 3600
+
+
+# ------------------------------------------------------------
+# 4.7.3 Lifecycle Bottleneck Results
+# ------------------------------------------------------------
+
+print("\n4.7.3 Lifecycle Bottleneck Results")
+
+completed_occurrences = occurrences[
+    occurrences["End_Status"].eq("complete")
+].copy()
+
+lifecycle_performance = (
+    completed_occurrences
+    .groupby(ACTIVITY)
+    .agg(
+        Completed_Occurrences=("Occurrence_ID", "size"),
+        Avg_Queue_Hours=("Queue_Time_Hours", "mean"),
+        Avg_Active_Processing_Hours=("Active_Processing_Hours", "mean"),
+        Avg_Suspension_Hours=("Suspension_Time_Hours", "mean"),
+        Avg_Total_Cycle_Hours=("Total_Cycle_Hours", "mean"),
+    )
+    .reset_index()
+)
+
+MIN_LIFECYCLE_OBSERVATIONS = 500
+
+lifecycle_bottleneck_summary = (
+    lifecycle_performance[
+        lifecycle_performance["Completed_Occurrences"]
+        >= MIN_LIFECYCLE_OBSERVATIONS
+    ]
+    .sort_values("Avg_Total_Cycle_Hours", ascending=False)
+    .copy()
+)
+
+for col in [
+    "Avg_Queue_Hours",
+    "Avg_Active_Processing_Hours",
+    "Avg_Suspension_Hours",
+    "Avg_Total_Cycle_Hours",
+]:
+    lifecycle_bottleneck_summary[col] = (
+        lifecycle_bottleneck_summary[col].round(2)
+    )
+
+print(lifecycle_bottleneck_summary.to_string(index=False))
+
+
+
+
+top10_activities.rename("Executions").to_csv(
+    OUTPUT_DIR / "top10_activity_frequency.csv"
+)
+top_bottlenecks.to_csv(
+    OUTPUT_DIR / "top10_bottlenecks.csv",
+    index=False,
+)
+lifecycle_bottleneck_summary.to_csv(
+    OUTPUT_DIR / "lifecycle_bottleneck_summary.csv",
+    index=False,
+)
+
+
+# ============================================================
+# TASK 5 - CONFORMANCE ANALYSIS AND DEVIATION CLASSIFICATION
+# ============================================================
+
+section("TASK 5 - CONFORMANCE ANALYSIS AND DEVIATION CLASSIFICATION")
+
+
+# ============================================================
+# 5.1 COMPLIANCE RULES CHECKING
+# ============================================================
+
+print("\n5.1 Compliance Rules Checking")
+
+
+# ============================================================
+# 5.1.1 RULES WITH NO DETECTED DEVIATIONS
+# These rule names and numbering follow the final report.
+# ============================================================
+
+print("\n5.1.1 Rules with No Detected Deviations")
+
+no_deviation_summary = []
+
+
+# ------------------------------------------------------------
+# R1 - Application Creation
+# A_Create Application must be the first business-level event.
+# ------------------------------------------------------------
+
+r1_no_dev_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+    compliant = bool(
+        activities
+        and activities[0] == "A_Create Application"
+    )
+
+    r1_no_dev_results.append({
+        "Unit_ID": case_id,
+        "Applicable": True,
+        "Compliant": compliant,
+    })
+
+r1_no_dev_df = pd.DataFrame(r1_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R1 - Application Creation",
+        r1_no_dev_df,
+    )
+)
+
+
+# ------------------------------------------------------------
+# R2 - Acceptance Before Offer
+# A_Accepted must occur before O_Create Offer.
+# The report treats all cases as checked units; cases without an
+# offer do not violate this particular ordering constraint.
+# ------------------------------------------------------------
+
+r2_no_dev_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+
+    if "O_Create Offer" in activities:
+        offer_pos = activities.index("O_Create Offer")
+        compliant = (
+            "A_Accepted" in activities
+            and activities.index("A_Accepted") < offer_pos
+        )
+    else:
+        compliant = True
+
+    r2_no_dev_results.append({
+        "Unit_ID": case_id,
+        "Applicable": True,
+        "Compliant": compliant,
+    })
+
+r2_no_dev_df = pd.DataFrame(r2_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R2 - Acceptance Before Offer",
+        r2_no_dev_df,
+    )
+)
+
+
+# ------------------------------------------------------------
+# R3 - Offer Creation Before Sending
+# If O_Sent (mail and online) occurs, O_Create Offer must occur first.
+# ------------------------------------------------------------
+
+r3_no_dev_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+
+    if "O_Sent (mail and online)" in activities:
+        sent_pos = activities.index("O_Sent (mail and online)")
+        compliant = (
+            "O_Create Offer" in activities
+            and activities.index("O_Create Offer") < sent_pos
+        )
+        applicable = True
+    else:
+        compliant = None
+        applicable = False
+
+    r3_no_dev_results.append({
+        "Unit_ID": case_id,
+        "Applicable": applicable,
+        "Compliant": compliant,
+    })
+
+r3_no_dev_df = pd.DataFrame(r3_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R3 - Offer Creation Before Sending",
+        r3_no_dev_df,
+    )
+)
+
+
+# ------------------------------------------------------------
+# R4 - Validation Sequence
+# W_Validate application must precede each A_Validating occurrence.
+# ------------------------------------------------------------
+
+r4_no_dev_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+
+    validating_positions = [
+        i for i, act in enumerate(activities)
+        if act == "A_Validating"
+    ]
+
+    if validating_positions:
+        compliant = all(
+            "W_Validate application" in activities[:pos]
+            for pos in validating_positions
+        )
+        applicable = True
+    else:
+        compliant = None
+        applicable = False
+
+    r4_no_dev_results.append({
+        "Unit_ID": case_id,
+        "Applicable": applicable,
+        "Compliant": compliant,
+    })
+
+r4_no_dev_df = pd.DataFrame(r4_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R4 - Validation Sequence",
+        r4_no_dev_df,
+    )
+)
+
+
+# ------------------------------------------------------------
+# R5 - Final Outcome Consistency
+# A case should not contain conflicting application outcome states.
+# ------------------------------------------------------------
+
+terminal_outcomes = [
+    "A_Pending",
+    "A_Denied",
+    "A_Cancelled",
+]
+
+r5_no_dev_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+    outcomes_found = {
+        act for act in activities
+        if act in terminal_outcomes
+    }
+
+    if outcomes_found:
+        applicable = True
+        compliant = len(outcomes_found) == 1
+    else:
+        applicable = False
+        compliant = None
+
+    r5_no_dev_results.append({
+        "Unit_ID": case_id,
+        "Applicable": applicable,
+        "Compliant": compliant,
+        "Final_Outcomes": ", ".join(sorted(outcomes_found)) if outcomes_found else "None",
+    })
+
+r5_no_dev_df = pd.DataFrame(r5_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R5 - Final Outcome Consistency",
+        r5_no_dev_df,
+    )
+)
+
+
+# ------------------------------------------------------------
+# R6 - Offer Lifecycle Start Integrity
+# For each OfferID, O_Created must be the first recorded O_ lifecycle event.
+
+# ------------------------------------------------------------
+
+if "OfferID" not in business_df.columns:
+    raise KeyError(
+        "OfferID is required for R6 - Offer Lifecycle Start Integrity."
+    )
+
+offer_events = business_df[
+    business_df[ACTIVITY].str.startswith("O_", na=False)
+].copy()
+
+offer_events_with_id = offer_events[
+    offer_events["OfferID"].notna()
+].copy()
+
+r6_no_dev_results = []
+
+for offer_id, offer in offer_events_with_id.groupby("OfferID", sort=False):
+    offer = offer.sort_values(
+        [TIME, "_event_order"],
+        kind="stable",
+    )
+    activities = offer[ACTIVITY].tolist()
+
+    compliant = bool(
+        activities
+        and "O_Created" in activities
+        and activities[0] == "O_Created"
+    )
+
+    r6_no_dev_results.append({
+        "Unit_ID": offer_id,
+        "Applicable": True,
+        "Compliant": compliant,
+    })
+
+r6_no_dev_df = pd.DataFrame(r6_no_dev_results)
+no_deviation_summary.append(
+    rule_summary(
+        "R6 - Offer Lifecycle Start Integrity",
+        r6_no_dev_df,
+    )
+)
+
+no_deviation_summary_df = pd.DataFrame(no_deviation_summary)
+
+print("\nSummary - Rules with No Detected Deviations")
+print(no_deviation_summary_df.to_string(index=False))
+
+no_deviation_summary_df.to_csv(
+    OUTPUT_DIR / "rules_no_detected_deviations.csv",
+    index=False,
+)
+
+
+# ============================================================
+# 5.1.2 RULES WITH DETECTED DEVIATIONS
+
+# ============================================================
+
+print("\n5.1.2 Rules with Detected Deviations")
+
+detected_deviation_summary = []
+
+
+# ------------------------------------------------------------
+# R1 - Excessive Validation Delay
+# Performance monitoring rule:
+# A_Complete -> W_Validate application
+# Cases exceeding the observed P90 are flagged.
+# ------------------------------------------------------------
+
+print("\nR1 - Excessive Validation Delay")
+
+r1_transition_df = business_df[
+    [CASE, ACTIVITY, TIME, "_event_order"]
+].copy()
+
+r1_transition_df = r1_transition_df.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable",
+)
+
+r1_group = r1_transition_df.groupby(CASE, sort=False)
+
+r1_transition_df["Next_Activity"] = r1_group[ACTIVITY].shift(-1)
+r1_transition_df["Next_Timestamp"] = r1_group[TIME].shift(-1)
+
+r1_transition_df["Elapsed_Days"] = (
+    r1_transition_df["Next_Timestamp"]
+    - r1_transition_df[TIME]
+).dt.total_seconds() / 86400
+
+validation_transition = r1_transition_df[
+    (r1_transition_df[ACTIVITY] == "A_Complete")
+    & (r1_transition_df["Next_Activity"] == "W_Validate application")
+].copy()
+
+R1_P90_THRESHOLD_DAYS = validation_transition["Elapsed_Days"].quantile(0.90)
+r1_average = validation_transition["Elapsed_Days"].mean()
+r1_median = validation_transition["Elapsed_Days"].median()
+
+validation_transition["Compliant"] = (
+    validation_transition["Elapsed_Days"] <= R1_P90_THRESHOLD_DAYS
+)
+
+validation_transition["Reason"] = validation_transition.apply(
+    lambda row: (
+        ""
+        if row["Compliant"]
+        else (
+            f"Validation delay of {row['Elapsed_Days']:.2f} days "
+            f"exceeds P90 threshold of {R1_P90_THRESHOLD_DAYS:.2f} days"
+        )
+    ),
+    axis=1,
+)
+
+r1_applicable = len(validation_transition)
+r1_compliant = validation_transition["Compliant"].eq(True).sum()
+r1_deviations = validation_transition["Compliant"].eq(False).sum()
+r1_rate = r1_deviations / r1_applicable * 100 if r1_applicable else 0.0
+
+r1_delayed_case_ids = validation_transition.loc[
+    validation_transition["Compliant"].eq(False),
+    CASE,
+].unique()
+r1_delayed_cases_count = len(r1_delayed_case_ids)
+
+print("Transition: A_Complete -> W_Validate application")
+print(f"Applicable transitions       : {r1_applicable:,}")
+print(f"Average elapsed time         : {r1_average:.2f} days")
+print(f"Median elapsed time          : {r1_median:.2f} days")
+print(f"P90 threshold                : {R1_P90_THRESHOLD_DAYS:.2f} days")
+print(f"Within threshold             : {r1_compliant:,}")
+print(f"Excessive-delay transitions  : {r1_deviations:,}")
+print(f"Cases with excessive delay   : {r1_delayed_cases_count:,}")
+print(f"Performance deviation rate   : {r1_rate:.2f}%")
+
+r1_violations = validation_transition[
+    validation_transition["Compliant"].eq(False)
+].copy()
+
+if not r1_violations.empty:
+    print("\nExample excessive-delay cases:")
+    print(
+        r1_violations[
+            [CASE, ACTIVITY, "Next_Activity", "Elapsed_Days", "Reason"]
+        ]
+        .head(10)
+        .to_string(index=False)
+    )
+
+detected_deviation_summary.append({
+    "Rule": "R1 - Excessive Validation Delay (> observed P90)",
+    "Applicable": int(r1_applicable),
+    "Compliant": int(r1_compliant),
+    "Deviations": int(r1_deviations),
+    "Deviation_Rate_%": round(float(r1_rate), 2),
+})
+
+
+# ------------------------------------------------------------
+# R2 - Mandatory Offer Transmission
+# If a case reaches O_Create Offer, an offer-sending event should
+# be recorded after creation before the case terminates.
+# Accepted sending events:
+#   - O_Sent (mail and online)
+#   - O_Sent (online only)
+# ------------------------------------------------------------
+
+print("\nR2 - Mandatory Offer Transmission")
+
+sending_activities = [
+    "O_Sent (mail and online)",
+    "O_Sent (online only)",
+]
+
+offer_creation = (
+    business_df[business_df[ACTIVITY].eq("O_Create Offer")]
+    .groupby(CASE)[TIME]
+    .min()
+    .rename("First_Offer_Creation")
+)
+
+offer_sending = (
+    business_df[business_df[ACTIVITY].isin(sending_activities)]
+    .groupby(CASE)[TIME]
+    .max()
+    .rename("Last_Offer_Sending")
+)
+
+offer_check = pd.concat(
+    [offer_creation, offer_sending],
+    axis=1,
+).loc[offer_creation.index].copy()
+
+offer_check["Compliant"] = (
+    offer_check["Last_Offer_Sending"].notna()
+    & (
+        offer_check["Last_Offer_Sending"]
+        > offer_check["First_Offer_Creation"]
+    )
+)
+
+offer_not_sent = offer_check[
+    offer_check["Compliant"].eq(False)
+].copy()
+
+r2_applicable = len(offer_check)
+r2_compliant = offer_check["Compliant"].eq(True).sum()
+r2_deviations = offer_check["Compliant"].eq(False).sum()
+r2_rate = r2_deviations / r2_applicable * 100 if r2_applicable else 0.0
+r2_deviating_case_ids = offer_not_sent.index.to_numpy()
+
+# Use full raw case duration for report comparison.
+raw_case_duration = (
+    df_discovery
+    .groupby(CASE)[TIME]
+    .agg(Start_Time="min", End_Time="max")
+)
+raw_case_duration["Duration_Days"] = (
+    raw_case_duration["End_Time"]
+    - raw_case_duration["Start_Time"]
+).dt.total_seconds() / 86400
+
+r2_nc_avg_duration = raw_case_duration.loc[
+    raw_case_duration.index.isin(r2_deviating_case_ids),
+    "Duration_Days",
+].mean()
+
+r2_c_avg_duration = raw_case_duration.loc[
+    raw_case_duration.index.isin(offer_check.index)
+    & ~raw_case_duration.index.isin(r2_deviating_case_ids),
+    "Duration_Days",
+].mean()
+
+print(f"Applicable cases (offer initiated)        : {r2_applicable:,}")
+print(f"Compliant cases (offer sent)              : {r2_compliant:,}")
+print(f"Cases with procedural deviation           : {r2_deviations:,}")
+print(f"Structural non-compliance rate            : {r2_rate:.2f}%")
+print(f"Average throughput time - compliant       : {r2_c_avg_duration:.2f} days")
+print(f"Average throughput time - non-compliant   : {r2_nc_avg_duration:.2f} days")
+
+detected_deviation_summary.append({
+    "Rule": "R2 - Mandatory Offer Transmission",
+    "Applicable": int(r2_applicable),
+    "Compliant": int(r2_compliant),
+    "Deviations": int(r2_deviations),
+    "Deviation_Rate_%": round(float(r2_rate), 2),
+})
+
+
+# ------------------------------------------------------------
+# R3 - Post-Acceptance Cancellation
+# A cancellation recorded after A_Accepted is flagged for review.
+# ------------------------------------------------------------
+
+print("\nR3 - Post-Acceptance Cancellation")
+
+accepted_time = (
+    business_df[business_df[ACTIVITY].eq("A_Accepted")]
+    .groupby(CASE)[TIME]
+    .min()
+    .rename("Accepted_Time")
+)
+
+cancelled_time = (
+    business_df[business_df[ACTIVITY].eq("A_Cancelled")]
+    .groupby(CASE)[TIME]
+    .max()
+    .rename("Cancelled_Time")
+)
+
+acceptance_check = pd.concat(
+    [accepted_time, cancelled_time],
+    axis=1,
+).reindex(business_df[CASE].drop_duplicates()).copy()
+
+acceptance_check["Deviation"] = (
+    acceptance_check["Accepted_Time"].notna()
+    & acceptance_check["Cancelled_Time"].notna()
+    & (
+        acceptance_check["Cancelled_Time"]
+        > acceptance_check["Accepted_Time"]
+    )
+)
+
+r3_deviating_case_ids = acceptance_check.index[
+    acceptance_check["Deviation"].eq(True)
+]
+
+r3_applicable = total_cases
+r3_deviations = len(r3_deviating_case_ids)
+r3_compliant = r3_applicable - r3_deviations
+r3_rate = r3_deviations / r3_applicable * 100 if r3_applicable else 0.0
+
+r3_nc_avg_duration = raw_case_duration.loc[
+    raw_case_duration.index.isin(r3_deviating_case_ids),
+    "Duration_Days",
+].mean()
+
+r3_c_avg_duration = raw_case_duration.loc[
+    ~raw_case_duration.index.isin(r3_deviating_case_ids),
+    "Duration_Days",
+].mean()
+
+r3_delay_difference = r3_nc_avg_duration - r3_c_avg_duration
+
+print(f"Total logged cases                         : {r3_applicable:,}")
+print(f"Compliant cases                            : {r3_compliant:,}")
+print(f"Cases requiring review                     : {r3_deviations:,}")
+print(f"Review / deviation rate                    : {r3_rate:.2f}%")
+print(f"Average throughput time - remaining cases  : {r3_c_avg_duration:.2f} days")
+print(f"Average throughput time - review cohort    : {r3_nc_avg_duration:.2f} days")
+print(f"Observed duration difference               : {r3_delay_difference:.2f} days")
+
+detected_deviation_summary.append({
+    "Rule": "R3 - Post-Acceptance Cancellation",
+    "Applicable": int(r3_applicable),
+    "Compliant": int(r3_compliant),
+    "Deviations": int(r3_deviations),
+    "Deviation_Rate_%": round(float(r3_rate), 2),
+})
+
+
+detected_deviation_summary_df = pd.DataFrame(
+    detected_deviation_summary
+)
+
+print("\nSummary - Rules with Detected Deviations")
+print(detected_deviation_summary_df.to_string(index=False))
+
+detected_deviation_summary_df.to_csv(
+    OUTPUT_DIR / "rules_with_detected_deviations.csv",
+    index=False,
+)
+
+
+# ============================================================
+# 5.3 PROCEDURAL EXECUTION AND AUTHORIZATION CHECKS
+# ============================================================
+
+print("\n5.3 Procedural Execution and Authorization Checks")
+
+# --------------------------------------------------------
+# 5.3.1 Submission Before Processing
+# --------------------------------------------------------
+print("\n5.3.1 Submission Before Processing")
+
+a1_results = []
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+
+    if "W_Complete application" in activities:
+        complete_pos = activities.index("W_Complete application")
+        compliant = "A_Submitted" in activities[:complete_pos]
+        applicable = True
+    else:
+        compliant = None
+        applicable = False
+
+    a1_results.append({
+        "Unit_ID": case_id,
+        "Applicable": applicable,
+        "Compliant": compliant,
+    })
+
+a1_df = pd.DataFrame(a1_results)
+
+
+# --------------------------------------------------------
+# 5.3.2 Revalidation After Incomplete Status
+# --------------------------------------------------------
+print("\n5.3.2 Revalidation After Incomplete Status")
+
+a2_results = []
+positive_outcomes = ["O_Accepted", "A_Pending"]
+
+for case_id, case in business_df.groupby(CASE, sort=False):
+    activities = case[ACTIVITY].tolist()
+    applicable = False
+    compliant = True
+
+    incomplete_positions = [
+        i for i, act in enumerate(activities)
+        if act == "A_Incomplete"
+    ]
+
+    for incomplete_pos in incomplete_positions:
+        later_positive_positions = [
+            i
+            for i in range(incomplete_pos + 1, len(activities))
+            if activities[i] in positive_outcomes
+        ]
+
+        if later_positive_positions:
+            applicable = True
+            outcome_pos = later_positive_positions[0]
+            between = activities[incomplete_pos + 1:outcome_pos]
+
+            if "W_Validate application" not in between:
+                compliant = False
+                break
+
+    a2_results.append({
+        "Unit_ID": case_id,
+        "Applicable": applicable,
+        "Compliant": compliant if applicable else None,
+    })
+
+a2_df = pd.DataFrame(a2_results)
+
+
+
+section_53_compliance_summary = pd.DataFrame([
+    rule_summary(
+        "Submission Before Processing",
+        a1_df,
+    ),
+    rule_summary(
+        "Revalidation After Incomplete Status",
+        a2_df,
+    ),
+])
+
+section_53_compliance_summary.to_csv(
+    OUTPUT_DIR / "section_5_3_compliance_rules.csv",
+    index=False,
+)
+
+
+# ------------------------------------------------------------
+# 5.3.3 Skipped Approvals, Wrong Execution Orders, and Unauthorized Resources
+# ------------------------------------------------------------
+print("\n5.3.3 Procedural Execution and Authorization Summary")
+
+# Preserve the original assignment logic so the results remain consistent with the report.
+log_df = df_discovery.copy()
+log_df["activity_lower"] = log_df[ACTIVITY].astype(str).str.lower()
+
+submission_like_cases = log_df[
+    log_df["activity_lower"].str.contains(
+        "create|submit|app|request",
+        na=False,
+        regex=True,
+    )
+][CASE].unique()
+
+approval_like_cases = log_df[
+    log_df["activity_lower"].str.contains(
+        "appr|accept|grant|confirm",
+        na=False,
+        regex=True,
+    )
+][CASE].unique()
+
+skipped_approval_count = len(
+    set(submission_like_cases) - set(approval_like_cases)
+)
+
+wrong_order_cases = []
+
+for case_id, group in log_df.groupby(CASE, sort=False):
+    group = group.sort_values(
+        [TIME, "_event_order"],
+        kind="stable",
+    )
+    activities_lower = group["activity_lower"].tolist()
+
+    approval_indices = [
+        i for i, act in enumerate(activities_lower)
+        if any(k in act for k in ["appr", "accept", "grant", "confirm"])
+    ]
+
+    validation_indices = [
+        i for i, act in enumerate(activities_lower)
+        if any(k in act for k in ["val", "check", "review"])
+    ]
+
+    if approval_indices and validation_indices:
+        if min(approval_indices) < min(validation_indices):
+            wrong_order_cases.append(case_id)
+
+wrong_order_count = len(set(wrong_order_cases))
+
+resource_col = RESOURCE if RESOURCE in log_df.columns else next(
+    (
+        col for col in log_df.columns
+        if "resource" in col.lower()
+        or "org" in col.lower()
+        or "user" in col.lower()
+    ),
+    None,
+)
+
+unauthorized_count = 0
+
+if resource_col:
+    unauthorized_values = {
+        "unassigned",
+        "unknown",
+        "guest",
+        "external",
+    }
+
+    unauthorized_cases = log_df[
+        log_df[resource_col]
+        .astype(str)
+        .str.lower()
+        .isin(unauthorized_values)
+    ]
+
+    unauthorized_count = unauthorized_cases[CASE].nunique()
+
+procedural_checks = pd.DataFrame([
+    {
+        "Check": "Skipped Approvals",
+        "Cases": skipped_approval_count,
+    },
+    {
+        "Check": "Wrong Execution Orders",
+        "Cases": wrong_order_count,
+    },
+    {
+        "Check": "Unauthorized Resources",
+        "Cases": unauthorized_count,
+    },
+])
+
+print(procedural_checks.to_string(index=False))
+procedural_checks.to_csv(
+    OUTPUT_DIR / "procedural_execution_authorization_checks.csv",
+    index=False,
+)
+
+
+# ============================================================
+# 5.4 VIOLATION ANALYSIS
+# ============================================================
+
+print("\n5.4 Violation Analysis")
+
+# Build one case-level review table from the three detected rules.
+case_review_details = raw_case_duration.copy()
+
+case_review_details["Excessive_Validation_Delay"] = (
+    case_review_details.index.isin(r1_delayed_case_ids)
+)
+
+case_review_details["Offer_Created_Not_Sent"] = (
+    case_review_details.index.isin(r2_deviating_case_ids)
+)
+
+case_review_details["Accepted_Then_Cancelled"] = (
+    case_review_details.index.isin(r3_deviating_case_ids)
+)
+
+violation_summary = pd.DataFrame({
+    "Metric": [
+        "Excessive validation delay",
+        "Offer created but not sent",
+        "Accepted then cancelled",
+        "Total Cases",
+    ],
+    "Result": [
+        f"{r1_delayed_cases_count:,} Cases",
+        f"{r2_deviations:,} Cases",
+        f"{r3_deviations:,} Cases",
+        f"{total_cases:,} Cases",
+    ],
+    "Interpretation": [
+        (
+            "A_Complete -> W_Validate application exceeded the "
+            f"observed P90 threshold of {R1_P90_THRESHOLD_DAYS:.2f} days."
+        ),
+        (
+            "O_Create Offer was not followed by a recorded offer-sending "
+            "activity after creation before termination."
+        ),
+        (
+            "A_Cancelled was recorded after A_Accepted within the same case."
+        ),
+        "Total loan application cases analyzed.",
+    ],
+})
+
+print(violation_summary.to_string(index=False))
+
+print("\nDuration comparison for R3 review cohort:")
+print(
+    f"Accepted-then-cancelled average duration : "
+    f"{r3_nc_avg_duration:.2f} days"
+)
+print(
+    f"Remaining cases average duration         : "
+    f"{r3_c_avg_duration:.2f} days"
+)
+
+violation_summary.to_csv(
+    OUTPUT_DIR / "Violation_Analysis_Summary.csv",
+    index=False,
+)
+
+case_review_details.reset_index().to_csv(
+    OUTPUT_DIR / "Violation_Review_Details.csv",
+    index=False,
+)
+
+# Export detailed rows for each detected deviation rule.
+r1_violations.to_csv(
+    OUTPUT_DIR / "R1_Excessive_Validation_Delay_Details.csv",
+    index=False,
+)
+
+offer_not_sent.reset_index().to_csv(
+    OUTPUT_DIR / "R2_Offer_Created_Not_Sent_Details.csv",
+    index=False,
+)
+
+acceptance_check[
+    acceptance_check["Deviation"].eq(True)
+].reset_index().to_csv(
+    OUTPUT_DIR / "R3_Post_Acceptance_Cancellation_Details.csv",
+    index=False,
+)
+
+
+
