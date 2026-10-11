@@ -1,0 +1,840 @@
+# -*- coding: utf-8 -*-
+"""
+Assignment 2 - Task 4
+Predictive Process Analytics: Repeated Validation Rework Risk
+BPI Challenge 2017
+
+"""
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pm4py
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    classification_report,
+)
+from sklearn.inspection import permutation_importance
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ============================================================
+# 0. GLOBAL SETTINGS
+# ============================================================
+
+CASE = "case:concept:name"
+ACTIVITY = "concept:name"
+TIME = "time:timestamp"
+LIFECYCLE = "lifecycle:transition"
+RESOURCE = "org:resource"
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "assignment2_task4_results"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+FILE_CANDIDATES = [
+    BASE_DIR / "BPI Challenge 2017.xes",
+    BASE_DIR / "BPI Challenge 2017.xes.gz",
+]
+
+FILE_PATH = next((p for p in FILE_CANDIDATES if p.exists()), None)
+
+if FILE_PATH is None:
+    raise FileNotFoundError(
+        "BPI Challenge 2017 event log was not found.\n\n"
+        "Put BPI Challenge 2017.xes or BPI Challenge 2017.xes.gz "
+        "in the same folder as this script."
+    )
+
+RANDOM_STATE = 42
+TRAIN_RATIO = 0.70
+
+
+# ============================================================
+# 1. LOAD AND PREPARE THE EVENT LOG
+# ============================================================
+
+print("=" * 90)
+print("ASSIGNMENT 2 - TASK 4: PREDICTIVE PROCESS ANALYTICS")
+print("=" * 90)
+print("Loading:", FILE_PATH)
+
+raw_df = pm4py.read_xes(str(FILE_PATH))
+
+required = [CASE, ACTIVITY, TIME, LIFECYCLE]
+missing = [c for c in required if c not in raw_df.columns]
+
+if missing:
+    raise KeyError("Missing required column(s): " + ", ".join(missing))
+
+raw_df = raw_df.dropna(
+    subset=[CASE, ACTIVITY, TIME]
+).drop_duplicates().copy()
+
+raw_df[TIME] = pd.to_datetime(
+    raw_df[TIME],
+    utc=True
+)
+
+raw_df["_event_order"] = range(len(raw_df))
+
+raw_df = raw_df.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable"
+).copy()
+
+print("Raw cases :", f"{raw_df[CASE].nunique():,}")
+print("Raw events:", f"{len(raw_df):,}")
+
+
+# ============================================================
+# 2. CREATE THE BUSINESS-LEVEL EVENT LOG
+# ============================================================
+
+business_df = raw_df[
+    (
+        raw_df[ACTIVITY].str.startswith(("A_", "O_"), na=False)
+        & raw_df[LIFECYCLE].eq("complete")
+    )
+    |
+    (
+        raw_df[ACTIVITY].str.startswith("W_", na=False)
+        & raw_df[LIFECYCLE].eq("schedule")
+    )
+].copy()
+
+business_df = business_df.sort_values(
+    [CASE, TIME, "_event_order"],
+    kind="stable"
+).copy()
+
+print("Business-level cases :", f"{business_df[CASE].nunique():,}")
+print("Business-level events:", f"{len(business_df):,}")
+
+
+# ============================================================
+# 3. DEFINE THE PREDICTION TARGET
+# ============================================================
+
+
+incomplete_events = business_df[
+    business_df[ACTIVITY].eq("A_Incomplete")
+].copy()
+
+first_incomplete = (
+    incomplete_events
+    .groupby(CASE, as_index=False)
+    .first()[[CASE, TIME, "_event_order"]]
+    .rename(
+        columns={
+            TIME: "Cutoff_Time",
+            "_event_order": "Cutoff_Order"
+        }
+    )
+)
+
+print("\nCases reaching A_Incomplete:", f"{len(first_incomplete):,}")
+
+
+# ============================================================
+# 4. BUILD ONE PREFIX-BASED ROW PER CASE
+# ============================================================
+
+rows = []
+
+# Case-level attributes that may exist in BPI 2017.
+candidate_case_attributes = [
+    "case:RequestedAmount",
+    "case:LoanGoal",
+    "case:ApplicationType",
+]
+
+available_case_attributes = [
+    c for c in candidate_case_attributes
+    if c in business_df.columns
+]
+
+# Build the case index once.
+# This keeps the exact same analytical logic, but avoids scanning the
+# full 582k-row business_df again for every incomplete case.
+business_by_case = business_df.groupby(CASE, sort=False)
+
+total_incomplete_cases = len(first_incomplete)
+
+for case_number, (_, cutoff_row) in enumerate(
+    first_incomplete.iterrows(),
+    start=1
+):
+    case_id = cutoff_row[CASE]
+    cutoff_time = cutoff_row["Cutoff_Time"]
+    cutoff_order = cutoff_row["Cutoff_Order"]
+
+    # Same events as before, retrieved directly from the pre-built
+    # case index instead of filtering the entire DataFrame each time.
+    case_events = business_by_case.get_group(case_id).copy()
+
+    # Progress message only; it does not affect the analysis.
+    if case_number % 1000 == 0 or case_number == total_incomplete_cases:
+        print(
+            f"Building predictive dataset: "
+            f"{case_number:,}/{total_incomplete_cases:,} cases"
+        )
+
+    # Prefix = only information available at prediction time.
+    prefix = case_events[
+        (case_events[TIME] < cutoff_time)
+        |
+        (
+            case_events[TIME].eq(cutoff_time)
+            & case_events["_event_order"].le(cutoff_order)
+        )
+    ].copy()
+
+    # Future = strictly after prediction time.
+    future = case_events[
+        (case_events[TIME] > cutoff_time)
+        |
+        (
+            case_events[TIME].eq(cutoff_time)
+            & case_events["_event_order"].gt(cutoff_order)
+        )
+    ].copy()
+
+    if prefix.empty:
+        continue
+
+    case_start = case_events[TIME].min()
+    elapsed_days = (
+        cutoff_time - case_start
+    ).total_seconds() / 86400
+
+    future_revalidations = (
+        future[ACTIVITY]
+        .eq("W_Validate application")
+        .sum()
+    )
+
+    target = int(future_revalidations >= 2)
+
+    activities = prefix[ACTIVITY].tolist()
+
+    row = {
+        CASE: case_id,
+        "Cutoff_Time": cutoff_time,
+        "Repeated_Revalidation_Rework": target,
+        "Future_Revalidation_Count": int(future_revalidations),
+
+        # Prefix timing / complexity features.
+        "Elapsed_Days_To_First_Incomplete": elapsed_days,
+        "Prefix_Event_Count": len(prefix),
+        "Prefix_Unique_Activities": prefix[ACTIVITY].nunique(),
+
+        # Activity-history features.
+        "W_Validate_Count_So_Far": activities.count("W_Validate application"),
+        "A_Validating_Count_So_Far": activities.count("A_Validating"),
+        "A_Incomplete_Count_So_Far": activities.count("A_Incomplete"),
+        "W_Call_Incomplete_Count_So_Far": activities.count("W_Call incomplete files"),
+        "W_Complete_Count_So_Far": activities.count("W_Complete application"),
+        "A_Complete_Count_So_Far": activities.count("A_Complete"),
+        "O_Create_Offer_Count_So_Far": activities.count("O_Create Offer"),
+        "O_Sent_Mail_Online_Count_So_Far": activities.count("O_Sent (mail and online)"),
+        "O_Sent_Online_Only_Count_So_Far": activities.count("O_Sent (online only)"),
+
+        # Calendar context at prediction time.
+        "Cutoff_Month": cutoff_time.month,
+        "Cutoff_DayOfWeek": cutoff_time.dayofweek,
+        "Cutoff_Hour": cutoff_time.hour,
+    }
+
+    # Resource features.
+    if RESOURCE in prefix.columns:
+        resource_values = prefix[RESOURCE].dropna().astype(str)
+        row["Unique_Resources_So_Far"] = resource_values.nunique()
+
+        incomplete_resource = prefix.loc[
+            prefix[ACTIVITY].eq("A_Incomplete"),
+            RESOURCE
+        ].dropna()
+
+        row["Resource_At_Incomplete"] = (
+            str(incomplete_resource.iloc[-1])
+            if len(incomplete_resource)
+            else "Unknown"
+        )
+    else:
+        row["Unique_Resources_So_Far"] = 0
+        row["Resource_At_Incomplete"] = "Unavailable"
+
+    # Last activity immediately before A_Incomplete.
+    if len(prefix) >= 2:
+        row["Previous_Activity"] = str(prefix.iloc[-2][ACTIVITY])
+    else:
+        row["Previous_Activity"] = "None"
+
+    # Optional case attributes.
+    for attr in available_case_attributes:
+        values = prefix[attr].dropna()
+        row[attr] = values.iloc[0] if len(values) else np.nan
+
+    rows.append(row)
+
+dataset = pd.DataFrame(rows)
+
+if dataset.empty:
+    raise ValueError(
+        "No predictive dataset could be created. "
+        "Check the A_Incomplete activity and filtering logic."
+    )
+
+dataset = dataset.sort_values(
+    "Cutoff_Time"
+).reset_index(drop=True)
+
+dataset.to_csv(
+    OUTPUT_DIR / "Task4_Predictive_Dataset.csv",
+    index=False
+)
+
+print("\n" + "=" * 90)
+print("PREDICTION TARGET")
+print("=" * 90)
+print("Prediction point: first A_Incomplete")
+print(
+    "Positive class: >= 2 future W_Validate application events "
+    "after the first A_Incomplete"
+)
+print("\nClass distribution:")
+print(
+    dataset["Repeated_Revalidation_Rework"]
+    .value_counts()
+    .rename(index={0: "No repeated rework", 1: "Repeated rework"})
+)
+print(
+    "\nPositive rate:",
+    f"{dataset['Repeated_Revalidation_Rework'].mean() * 100:.2f}%"
+)
+
+
+# ============================================================
+# 5. CHRONOLOGICAL CASE-LEVEL TRAIN / TEST SPLIT
+# ============================================================
+
+
+split_index = int(len(dataset) * TRAIN_RATIO)
+
+train_df = dataset.iloc[:split_index].copy()
+test_df = dataset.iloc[split_index:].copy()
+
+target_col = "Repeated_Revalidation_Rework"
+
+drop_cols = [
+    CASE,
+    "Cutoff_Time",
+    "Future_Revalidation_Count",  # Future -> label-generation only.
+    target_col,
+]
+
+feature_cols = [
+    c for c in dataset.columns
+    if c not in drop_cols
+]
+
+X_train = train_df[feature_cols].copy()
+y_train = train_df[target_col].copy()
+
+X_test = test_df[feature_cols].copy()
+y_test = test_df[target_col].copy()
+
+if y_train.nunique() < 2 or y_test.nunique() < 2:
+    raise ValueError(
+        "The chronological split produced only one class in train or test. "
+        "Try a different TRAIN_RATIO while keeping the split chronological."
+    )
+
+print("\n" + "=" * 90)
+print("CHRONOLOGICAL SPLIT")
+print("=" * 90)
+print("Training cases:", f"{len(train_df):,}")
+print("Testing cases :", f"{len(test_df):,}")
+print("Training period:", train_df["Cutoff_Time"].min(), "->", train_df["Cutoff_Time"].max())
+print("Testing period :", test_df["Cutoff_Time"].min(), "->", test_df["Cutoff_Time"].max())
+
+
+# ============================================================
+# 6. FEATURE PREPROCESSING
+# ============================================================
+
+numeric_features = (
+    X_train
+    .select_dtypes(include=["number", "bool"])
+    .columns
+    .tolist()
+)
+
+categorical_features = [
+    c for c in feature_cols
+    if c not in numeric_features
+]
+
+numeric_pipeline = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ]
+)
+
+# Compatible with newer and older scikit-learn versions.
+try:
+    encoder = OneHotEncoder(
+        handle_unknown="ignore",
+        sparse_output=False
+    )
+except TypeError:
+    encoder = OneHotEncoder(
+        handle_unknown="ignore",
+        sparse=False
+    )
+
+categorical_pipeline = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", encoder),
+    ]
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_pipeline, numeric_features),
+        ("cat", categorical_pipeline, categorical_features),
+    ],
+    remainder="drop",
+)
+
+
+# ============================================================
+# 7. TRAIN AND COMPARE FOUR MODELS
+# ============================================================
+
+models = {
+    "Logistic Regression": LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        random_state=RANDOM_STATE
+    ),
+    "Decision Tree": DecisionTreeClassifier(
+        max_depth=8,
+        min_samples_leaf=20,
+        class_weight="balanced",
+        random_state=RANDOM_STATE
+    ),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=5,
+        class_weight="balanced_subsample",
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    ),
+}
+
+# XGBoost is required by the assignment comparison.
+try:
+    from xgboost import XGBClassifier
+
+    positives = int(y_train.sum())
+    negatives = int(len(y_train) - positives)
+
+    scale_pos_weight = (
+        negatives / positives
+        if positives > 0
+        else 1.0
+    )
+
+    models["XGBoost"] = XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric="logloss",
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+
+except ImportError:
+    print(
+        "\nWARNING: xgboost is not installed. "
+        "Run: pip install xgboost\n"
+        "The other three models will still run."
+    )
+
+
+# ============================================================
+# 8. EVALUATE MODELS
+# ============================================================
+
+results = []
+fitted_models = {}
+
+for model_name, model in models.items():
+    pipeline = Pipeline(
+        steps=[
+            ("preprocess", preprocessor),
+            ("model", model),
+        ]
+    )
+
+    print("\nTraining:", model_name)
+
+    pipeline.fit(
+        X_train,
+        y_train
+    )
+
+    y_pred = pipeline.predict(
+        X_test
+    )
+
+    if hasattr(pipeline, "predict_proba"):
+        y_score = pipeline.predict_proba(
+            X_test
+        )[:, 1]
+    else:
+        y_score = pipeline.decision_function(
+            X_test
+        )
+
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(
+        y_test,
+        y_pred,
+        zero_division=0
+    )
+    recall = recall_score(
+        y_test,
+        y_pred,
+        zero_division=0
+    )
+    f1 = f1_score(
+        y_test,
+        y_pred,
+        zero_division=0
+    )
+    auc = roc_auc_score(
+        y_test,
+        y_score
+    )
+
+    results.append({
+        "Model": model_name,
+        "Accuracy": accuracy,
+        "Precision": precision,
+        "Recall": recall,
+        "F1": f1,
+        "AUC": auc,
+    })
+
+    fitted_models[model_name] = pipeline
+
+    # Save detailed classification report.
+    report = classification_report(
+        y_test,
+        y_pred,
+        target_names=[
+            "No repeated rework",
+            "Repeated rework"
+        ],
+        zero_division=0,
+        output_dict=True
+    )
+
+    pd.DataFrame(report).transpose().to_csv(
+        OUTPUT_DIR / (
+            model_name.lower()
+            .replace(" ", "_")
+            + "_classification_report.csv"
+        )
+    )
+
+    # Confusion matrix.
+    cm = confusion_matrix(
+        y_test,
+        y_pred
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(5, 4)
+    )
+
+    image = ax.imshow(cm)
+
+    ax.set_title(
+        f"Confusion Matrix - {model_name}"
+    )
+    ax.set_xlabel(
+        "Predicted class"
+    )
+    ax.set_ylabel(
+        "Actual class"
+    )
+    ax.set_xticks(
+        [0, 1],
+        labels=[
+            "No Rework",
+            "Repeated Rework"
+        ]
+    )
+    ax.set_yticks(
+        [0, 1],
+        labels=[
+            "No Rework",
+            "Repeated Rework"
+        ]
+    )
+
+    for i in range(2):
+        for j in range(2):
+            ax.text(
+                j,
+                i,
+                str(cm[i, j]),
+                ha="center",
+                va="center"
+            )
+
+    fig.colorbar(
+        image,
+        ax=ax
+    )
+
+    fig.tight_layout()
+
+    fig.savefig(
+        OUTPUT_DIR / (
+            model_name.lower()
+            .replace(" ", "_")
+            + "_confusion_matrix.png"
+        ),
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+
+results_df = (
+    pd.DataFrame(results)
+    .sort_values(
+        ["F1", "AUC"],
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+for col in [
+    "Accuracy",
+    "Precision",
+    "Recall",
+    "F1",
+    "AUC"
+]:
+    results_df[col] = (
+        results_df[col]
+        .round(4)
+    )
+
+results_df.to_csv(
+    OUTPUT_DIR / "Task4_Model_Comparison.csv",
+    index=False
+)
+
+print("\n" + "=" * 90)
+print("MODEL COMPARISON")
+print("=" * 90)
+print(
+    results_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# 9. SELECT THE BEST MODEL
+# ============================================================
+
+
+best_model_name = results_df.iloc[0]["Model"]
+best_model = fitted_models[best_model_name]
+
+print("\nBest model:", best_model_name)
+
+
+# ============================================================
+# 10. FEATURE IMPORTANCE / EXPLANATION
+# ============================================================
+
+
+importance_result = permutation_importance(
+    best_model,
+    X_test,
+    y_test,
+    scoring="f1",
+    n_repeats=10,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+importance_df = pd.DataFrame({
+    "Feature": feature_cols,
+    "Importance_Mean": importance_result.importances_mean,
+    "Importance_STD": importance_result.importances_std,
+}).sort_values(
+    "Importance_Mean",
+    ascending=False
+).reset_index(drop=True)
+
+importance_df.to_csv(
+    OUTPUT_DIR / "Task4_Feature_Importance.csv",
+    index=False
+)
+
+top_importance = (
+    importance_df
+    .head(15)
+    .sort_values("Importance_Mean")
+)
+
+fig, ax = plt.subplots(
+    figsize=(9, 6)
+)
+
+ax.barh(
+    top_importance["Feature"],
+    top_importance["Importance_Mean"]
+)
+
+ax.set_title(
+    f"Top Predictive Features - {best_model_name}"
+)
+ax.set_xlabel(
+    "Permutation Importance (F1 decrease)"
+)
+ax.set_ylabel(
+    "Feature"
+)
+
+fig.tight_layout()
+
+fig.savefig(
+    OUTPUT_DIR / "Task4_Feature_Importance.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close(fig)
+
+
+# ============================================================
+# 11. SAVE TEST-SET PREDICTIONS
+# ============================================================
+
+best_predictions = best_model.predict(
+    X_test
+)
+
+best_probabilities = best_model.predict_proba(
+    X_test
+)[:, 1]
+
+prediction_output = test_df[
+    [
+        CASE,
+        "Cutoff_Time",
+        target_col
+    ]
+].copy()
+
+prediction_output[
+    "Predicted_Repeated_Rework"
+] = best_predictions
+
+prediction_output[
+    "Predicted_Probability"
+] = best_probabilities
+
+prediction_output.to_csv(
+    OUTPUT_DIR / "Task4_Test_Predictions.csv",
+    index=False
+)
+
+
+# ============================================================
+# 12. FINAL SUMMARY
+# ============================================================
+
+print("\n" + "=" * 90)
+print("TASK 4 FINAL SUMMARY")
+print("=" * 90)
+
+print(
+    "Target: predict repeated validation rework "
+    "at the first A_Incomplete event."
+)
+
+print(
+    "Positive class: two or more future "
+    "W_Validate application events."
+)
+
+print(
+    "Split: chronological case-level "
+    f"{int(TRAIN_RATIO * 100)}/"
+    f"{100 - int(TRAIN_RATIO * 100)}."
+)
+
+print(
+    "Models compared:",
+    ", ".join(models.keys())
+)
+
+print(
+    "Best model:",
+    best_model_name
+)
+
+best_row = results_df.iloc[0]
+
+print(
+    f"Best F1: {best_row['F1']:.4f}"
+)
+print(
+    f"Best AUC: {best_row['AUC']:.4f}"
+)
+
+print("\nFiles saved in:")
+print(OUTPUT_DIR)
+
+print("\nMain output files:")
+print("- Task4_Predictive_Dataset.csv")
+print("- Task4_Model_Comparison.csv")
+print("- Task4_Feature_Importance.csv")
+print("- Task4_Feature_Importance.png")
+print("- Task4_Test_Predictions.csv")
+print("- One confusion matrix per model")
